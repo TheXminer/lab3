@@ -1,10 +1,19 @@
-﻿#include <iostream>
+#include <iostream>
 #include <thread>
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
 #include <queue>
 #include <functional>
+#include <map>
+
+enum Task_Status
+{
+    NotFound,
+    NotStarted,
+    InProgress,
+    Completed
+};
 
 using read_write_lock = std::shared_mutex;
 using read_lock = std::shared_lock<read_write_lock>;
@@ -13,9 +22,15 @@ using write_lock = std::unique_lock<read_write_lock>;
 template <typename task_type_T> 
 struct task_queue {
 private:
-    using task_queue_implementation = std::queue<task_type_T>;
+    using task_queue_implementation = std::queue<std::pair<unsigned int, task_type_T>>;
     mutable read_write_lock m_rw_lock;
-    task_queue_implementation task_queue;
+    task_queue_implementation m_tasks;
+    unsigned int ID_counter = 0;
+
+private:
+    std::map<unsigned int, Task_Status> task_statuses;
+    mutable read_write_lock task_rw_lock;
+
 public:
     inline task_queue() = default;
     inline ~task_queue() { clear(); }
@@ -24,12 +39,17 @@ public:
     inline size_t size();
     inline bool empty();
 
+public:
     template <typename... arguments>
-    inline void emplace(arguments&&... parameters);
+    inline unsigned int emplace(arguments&&... parameters);
+
+    inline bool pop(unsigned int& ID, task_type_T& task);
+    inline void clear();
 
 public:
-    inline void clear();
-    inline bool pop(task_type_T& task);
+    inline bool add_status(unsigned int ID);
+    inline void set_status(unsigned int ID, Task_Status status);
+    inline Task_Status get_status(unsigned int ID);
 };
 
 class thread_pool {
@@ -47,7 +67,10 @@ public:
 
 public:
     template <typename task_t, typename... arguments>
-    inline void add_task(task_t&& task, arguments&&... parameters);
+    inline unsigned int add_task(task_t&& task, arguments&&... parameters);
+
+public:
+    Task_Status get_task_status(unsigned int ID);
 
 private:
     mutable read_write_lock m_rw_lock;
@@ -65,42 +88,79 @@ template<typename task_type_T>
 inline size_t task_queue<task_type_T>::size()
 {
     read_lock _(m_rw_lock);
-    return task_queue.size();
+    return m_tasks.size();
 }
 
 template<typename task_type_T>
 inline bool task_queue<task_type_T>::empty()
 {
     read_lock _(m_rw_lock);
-    return task_queue.empty();
+    return m_tasks.empty();
 }
 
 template<typename task_type_T>
 inline void task_queue<task_type_T>::clear()
 {
     write_lock _(m_rw_lock);
-    while (!task_queue.empty()) {
-        task_queue.pop();
+    while (!m_tasks.empty()) {
+        m_tasks.pop();
+    }
+    task_statuses.clear();
+}
+
+template<typename task_type_T>
+inline bool task_queue<task_type_T>::add_status(unsigned int ID)
+{
+    write_lock _(task_rw_lock);
+    if (task_statuses.count(ID) != 0)
+        return false;
+
+    std::cout << ID << ": " << "\033[31mNotStarted\033[0m" << std::endl;
+    task_statuses[ID] = Task_Status::NotStarted;
+    return true;
+}
+
+template<typename task_type_T>
+inline void task_queue<task_type_T>::set_status(unsigned int ID, Task_Status status)
+{
+    write_lock _(task_rw_lock);
+    auto it = task_statuses.find(ID);
+    if (it != task_statuses.end()) {
+        it->second = status;
+        std::cout << ID << ": " << ((status == Task_Status::InProgress) ? "\033[33mInProgress\033[0m" : "\033[32mCompleted\033[0m") << std::endl;
     }
 }
 
+template<typename task_type_T>
+inline Task_Status task_queue<task_type_T>::get_status(unsigned int ID)
+{
+    read_lock _(task_rw_lock);
+    auto it = task_statuses.find(ID);
+    if (it == task_statuses.end()) {
+        return Task_Status::NotFound;
+    }
+    return it->second;
+}
+
 template <typename task_type_T>
-bool task_queue<task_type_T>::pop(task_type_T& task) {
+bool task_queue<task_type_T>::pop(unsigned int& ID, task_type_T& task) {
     write_lock _(m_rw_lock);
-    if (task_queue.empty()) {
+    if (m_tasks.empty()) {
         return false;
     }
-    else {
-        task = std::move(task_queue.pop());
-        return true;
-    }
+    std::tie(ID, task) = std::move(m_tasks.front());
+    m_tasks.pop();
+    return true;
 }
 
 template <typename task_type_T>
 template <typename... arguments>
-void task_queue<task_type_T>::emplace(arguments&&... parameters) {
+unsigned int task_queue<task_type_T>::emplace(arguments&&... parameters) {
     write_lock _(m_rw_lock);
-    task_queue.emplace(std::forward<arguments>(parameters)...);
+    ID_counter++;
+    m_tasks.emplace(ID_counter, std::forward<arguments>(parameters)...);
+    add_status(ID_counter);
+    return ID_counter;
 }
 
 void thread_pool::initialize(const size_t worker_count)
@@ -147,11 +207,12 @@ void thread_pool::routine()
 {
     while (true) {
         bool task_accquired = false;
+        unsigned int task_ID = 0;
         std::function<void()> task;
         {
             write_lock _(m_rw_lock);
-            auto wait_condition = [this, &task_accquired, &task] {
-                task_accquired = m_tasks.pop(task);
+            auto wait_condition = [this, &task_accquired, &task, &task_ID] {
+                task_accquired = m_tasks.pop(task_ID, task);
                 return m_terminated || task_accquired;
                 };
 
@@ -159,24 +220,29 @@ void thread_pool::routine()
         }
         if (m_terminated && !task_accquired)
             return;
+        m_tasks.set_status(task_ID, Task_Status::InProgress);
         task();
+        m_tasks.set_status(task_ID, Task_Status::Completed);
     }
 }
 
 template<typename task_t, typename ...arguments>
-inline void thread_pool::add_task(task_t&& task, arguments && ...parameters)
+inline unsigned int thread_pool::add_task(task_t&& task, arguments && ...parameters)
 {
     {
         read_lock _(m_rw_lock);
         if (!working_unsafe()) {
-            return;
+            return 0;
         }
     }
 
+
+
     auto bind = std::bind(std::forward<task_t>(task), std::forward<arguments>(parameters)...);
 
-    m_tasks.emplace(bind);
+    int task_ID = m_tasks.emplace(bind);
     m_task_writer.notify_one();
+    return task_ID;
 }
 
 bool thread_pool::working() const
@@ -190,16 +256,37 @@ bool thread_pool::working_unsafe() const
     return !m_terminated && m_initialized;
 }
 
+void thread_func() {
+    int sleep_time = rand() % 6 + 5;
+    std::this_thread::sleep_for(std::chrono::seconds(sleep_time));
+}
+
 int main()
 {
     thread_pool pool;
-    //add tasks
     pool.initialize(4);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
+    pool.add_task(thread_func);
 }
-
-enum Task_Status
-{
-    NotStarted,
-    InProgress,
-    Completed
-};

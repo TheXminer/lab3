@@ -6,6 +6,7 @@
 #include <queue>
 #include <functional>
 #include <map>
+#include <random>
 
 enum Task_Status
 {
@@ -71,13 +72,16 @@ public:
 
 public:
     Task_Status get_task_status(unsigned int ID);
+    int get_task_results(unsigned int ID);
 
 private:
     mutable read_write_lock m_rw_lock;
-     mutable std::condition_variable_any m_task_writer;
+    mutable std::condition_variable_any m_task_writer;
     std::vector<std::thread> m_workers;
 
-    task_queue<std::function<void()>> m_tasks;
+    task_queue<std::function<int()>> m_tasks;
+    std::map<unsigned int, int> task_results;
+    mutable read_write_lock result_rw_lock;
 
     bool m_initialized = false;
     bool m_terminated = false;
@@ -208,7 +212,7 @@ void thread_pool::routine()
     while (true) {
         bool task_accquired = false;
         unsigned int task_ID = 0;
-        std::function<void()> task;
+        std::function<int()> task;
         {
             write_lock _(m_rw_lock);
             auto wait_condition = [this, &task_accquired, &task, &task_ID] {
@@ -221,7 +225,9 @@ void thread_pool::routine()
         if (m_terminated && !task_accquired)
             return;
         m_tasks.set_status(task_ID, Task_Status::InProgress);
-        task();
+        int a = task();
+        write_lock _(result_rw_lock);
+        task_results[task_ID] = a;
         m_tasks.set_status(task_ID, Task_Status::Completed);
     }
 }
@@ -235,8 +241,6 @@ inline unsigned int thread_pool::add_task(task_t&& task, arguments && ...paramet
             return 0;
         }
     }
-
-
 
     auto bind = std::bind(std::forward<task_t>(task), std::forward<arguments>(parameters)...);
 
@@ -256,37 +260,40 @@ bool thread_pool::working_unsafe() const
     return !m_terminated && m_initialized;
 }
 
-void thread_func() {
-    int sleep_time = rand() % 6 + 5;
+Task_Status thread_pool::get_task_status(unsigned int ID)
+{
+    return m_tasks.get_status(ID);
+}
+
+int thread_pool::get_task_results(unsigned int ID)
+{
+    read_lock _(result_rw_lock);
+    auto it = task_results.find(ID);
+    if (it == task_results.end()) {
+        throw std::runtime_error("Error: wrong task ID"); // Краще `std::runtime_error`
+    }
+    return it->second;
+}
+
+std::default_random_engine generator;
+int thread_func() {
+    std::uniform_int_distribution<int> distribution(5, 10);
+    int sleep_time = distribution(generator);
     std::this_thread::sleep_for(std::chrono::seconds(sleep_time));
+    return sleep_time;
 }
 
 int main()
 {
     thread_pool pool;
     pool.initialize(4);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
-    pool.add_task(thread_func);
+    
+    for(int i = 0; i < 25; i++)
+        pool.add_task(thread_func);
+    
+    std::this_thread::sleep_for(std::chrono::seconds(60));
+    std::cout << std::endl << std::endl << std::endl;
+    for (int i = 1; i < 26; i++) {
+        std::cout << i << ": " << pool.get_task_results(i) << std::endl;
+    }
 }
